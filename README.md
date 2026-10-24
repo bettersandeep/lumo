@@ -55,18 +55,30 @@ Some bulbs do not reply to broadcast messages while their Wi-Fi is in power save
 This also includes ARP requests, so the Mac cannot find the hardware address of the bulb.
 You can see this problem with `arp -an`: the bulb shows as `(incomplete)`.
 
-To fix it, tell the Mac the hardware address of the bulb.
-Find the IP and MAC address of the bulb in your router, or with a ping sweep from another device.
-Then run (replace the IP and MAC address):
+A bulb can work for some time and then stop, when the Mac forgets its hardware address.
+
+To fix it, pin the hardware address of each bulb on the Mac:
 
 ```sh
-sudo arp -d 192.168.1.50 ifscope en0
-sudo arp -s 192.168.1.50 98:77:d5:aa:bb:cc ifscope en0
+./pin-bulbs.sh
 ```
 
-The Mac forgets this entry when it restarts.
-To keep it, add a LaunchDaemon that runs the same commands at boot.
-Also reserve the IP address of the bulb in your router (DHCP reservation), so that the IP address does not change.
+The script pins the bulbs that Lumo finds now.
+It installs a LaunchDaemon that adds the entries again at each boot and network change.
+It asks for your password.
+
+If Lumo does not find a bulb, give its IP and MAC address.
+Find them in your router, or with a ping sweep from another device.
+
+```sh
+./pin-bulbs.sh 192.168.1.50=98:77:d5:aa:bb:cc 192.168.1.51=98:77:d5:aa:bb:dd
+```
+
+Run the script again when you add a bulb.
+To remove the LaunchDaemon, run `./pin-bulbs.sh --remove`.
+
+Also reserve the IP address of each bulb in your router (DHCP reservation).
+If the router gives a bulb a new IP address, the pinned entry is wrong.
 
 ### Commands do nothing
 
