@@ -12,7 +12,9 @@ It does not use the WiZ cloud and it does not need a WiZ account.
 - Turn bulbs on and off, one at a time or all together.
 - Set brightness and white colour temperature (warm to cool).
 - Pick a colour from a colour wheel or from 12 common colours.
-- Start one of the 32 standard WiZ scenes.
+- Start one of the 32 standard WiZ scenes. The menu shows the scene that is on now.
+- Save the state of a bulb as a preset.
+- Apply presets by time of day (schedule).
 - Give each bulb a name (alias).
 - Start at login.
 
@@ -40,6 +42,37 @@ Click the bulb icon in the menu bar.
 Each bulb has its own submenu.
 If there is more than one bulb, the **All lights** submenu controls all of them.
 To give a bulb a name, open its submenu and click **Rename…**.
+
+### Presets
+
+1. Set a bulb as you like it, with the menu or with the WiZ app.
+2. Open the submenu of the bulb and click **Save as Preset…**.
+3. Type a name and click **Save**.
+
+Lumo saves the on or off state, the brightness, and the colour, white temperature or scene.
+To apply a preset, open **Presets** in the submenu of a bulb or in **All lights**.
+To delete a preset, use **Presets > Delete**.
+When you delete a preset, Lumo also deletes the schedule rules that use it.
+
+### Schedule
+
+1. Click **Schedule > Add Rule…**.
+2. Select the start time (**From**), the end time (**To**), the lights and the preset.
+3. Click **Save**.
+
+The schedule works like Screen Time downtime.
+At the start time, Lumo saves the state of the lights and applies the preset.
+At the end time, Lumo puts the lights back to the saved state.
+A rule can cross midnight, for example from 10:00 PM to 7:00 AM.
+
+Lumo applies a rule one time.
+If you change a light by hand during the rule, Lumo does not change it back until the end time.
+If the Mac is asleep or Lumo is closed at the start time, Lumo applies the rule when the Mac wakes or Lumo starts, if the end time has not passed.
+If the Mac is asleep at the end time, Lumo puts the lights back when the Mac wakes.
+
+A rule for one bulb is stronger than a rule for **All lights**.
+
+To delete a rule, open the rule and click **Delete**.
 
 To list the bulbs from the terminal:
 

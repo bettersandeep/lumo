@@ -22,12 +22,14 @@ func udpSocket(timeout: Int = 0) -> Int32 {
     return fd
 }
 
-func send(_ fd: Int32, _ json: String, to ip: String) {
+// Returns false if macOS cannot send, for example when the network is not up yet after wake.
+@discardableResult
+func send(_ fd: Int32, _ json: String, to ip: String) -> Bool {
     var a = sockaddrIn(ip)
     let bytes = Array(json.utf8)
-    withUnsafePointer(to: &a) {
+    return withUnsafePointer(to: &a) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            _ = sendto(fd, bytes, bytes.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            sendto(fd, bytes, bytes.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) >= 0
         }
     }
 }
@@ -69,15 +71,45 @@ func discover() -> [Bulb] {
         usleep(300_000)
     }
     var found: [String: String] = [:]
+    while let (ip, reply) = receive(fd) { found[ip] = (reply?["result"] as? [String: Any])?["mac"] as? String ?? ip }
+    return found.map { Bulb(ip: $0.key, mac: $0.value) }.sorted { $0.ip < $1.ip }
+}
+
+// One UDP reply: sender IP and parsed JSON. nil on timeout or error.
+func receive(_ fd: Int32) -> (String, [String: Any]?)? {
     var buf = [UInt8](repeating: 0, count: 2048)
     var from = sockaddr_in()
     var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-    while case let n = withUnsafeMutablePointer(to: &from, { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(fd, &buf, buf.count, 0, $0, &len) } }), n > 0 {
-        let reply = try? JSONSerialization.jsonObject(with: Data(buf[0..<n])) as? [String: Any]
-        let ip = String(cString: inet_ntoa(from.sin_addr))
-        found[ip] = (reply?["result"] as? [String: Any])?["mac"] as? String ?? ip
+    let n = withUnsafeMutablePointer(to: &from) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(fd, &buf, buf.count, 0, $0, &len) } }
+    guard n > 0 else { return nil }
+    return (String(cString: inet_ntoa(from.sin_addr)), try? JSONSerialization.jsonObject(with: Data(buf[0..<n])) as? [String: Any])
+}
+
+// setPilot params that bring a bulb back to the state in a getPilot result.
+func presetParams(_ r: [String: Any]) -> String {
+    var p: [String: Any] = ["state": r["state"] as? Bool ?? false]
+    if p["state"] as? Bool == true {
+        let keys = (r["sceneId"] as? Int ?? 0) > 0 ? ["sceneId", "speed", "dimming"] : r["temp"] != nil ? ["temp", "dimming"] : ["r", "g", "b", "c", "w", "dimming"]
+        for k in keys { p[k] = r[k] }
     }
-    return found.map { Bulb(ip: $0.key, mac: $0.value) }.sorted { $0.ip < $1.ip }
+    return String(data: try! JSONSerialization.data(withJSONObject: p, options: .sortedKeys), encoding: .utf8)!
+}
+
+// From `minute` to `end` (minutes after midnight), `preset` is on for the bulb with MAC `bulb`, or for all bulbs if `bulb` is empty.
+struct Rule: Codable {
+    let minute: Int, bulb: String, preset: String
+    let end: Int? // nil in rules saved before end times existed: a full day
+    var stop: Int { end ?? minute }
+    var key: String { "\(minute)-\(stop)-\(bulb)-\(preset)" }
+
+    // The last window of this rule that started at or before `now`. A window can cross midnight.
+    func window(at now: Date) -> (start: Date, end: Date) {
+        let cal = Calendar.current
+        var start = cal.date(bySettingHour: minute / 60, minute: minute % 60, second: 0, of: now)!
+        if start > now { start = cal.date(byAdding: .day, value: -1, to: start)! }
+        let length = (stop - minute + 1439) % 1440 + 1 // 1...1440; the same start and end is a full day
+        return (start, cal.date(byAdding: .minute, value: length, to: start)!)
+    }
 }
 
 // Scene IDs from the WiZ local API, checked on a bulb with setPilot sceneId.
@@ -171,7 +203,7 @@ class ColorWheel: NSView {
     override func mouseUp(with e: NSEvent) { pick(e, force: true) }
 }
 
-class App: NSObject, NSApplicationDelegate {
+class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let fd = udpSocket()
     var bulbs: [Bulb] = []
@@ -180,6 +212,19 @@ class App: NSObject, NSApplicationDelegate {
         get { UserDefaults.standard.dictionary(forKey: "aliases") as? [String: String] ?? [:] }
         set { UserDefaults.standard.set(newValue, forKey: "aliases") }
     }
+    // Preset name -> setPilot params as JSON.
+    var presets: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: "presets") as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "presets") }
+    }
+    var rules: [Rule] {
+        get { UserDefaults.standard.data(forKey: "rules").flatMap { try? JSONDecoder().decode([Rule].self, from: $0) } ?? [] }
+        set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: "rules") }
+    }
+    // Last known getPilot result of each bulb, by IP.
+    var pilots: [String: [String: Any]] = [:]
+    var pilotTimes: [String: Date] = [:]
+    var sceneItems: [(item: NSMenuItem, targets: [String])] = []
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let icon = NSImage(systemSymbolName: "lightbulb.max.fill", accessibilityDescription: "Lumo")
@@ -189,7 +234,52 @@ class App: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(true, forKey: "loginAsked")
             try? SMAppService.mainApp.register()
         }
+        Thread {
+            while true {
+                guard let (ip, reply) = receive(self.fd), reply?["method"] as? String == "getPilot",
+                      let r = reply?["result"] as? [String: Any] else { continue }
+                DispatchQueue.main.async { self.pilots[ip] = r; self.pilotTimes[ip] = Date(); self.refreshChecks() }
+            }
+        }.start()
+        // Common mode, so that the schedule also runs while a menu is open.
+        RunLoop.main.add(Timer(timeInterval: 5, repeats: true) { _ in self.tick() }, forMode: .common)
         rediscover()
+    }
+
+    // Like Screen Time downtime. When the window of a rule starts, Lumo saves the state of each bulb and applies
+    // the preset, one time. Changes you make by hand stay. When the window ends, Lumo puts back the saved state.
+    // If the Mac was asleep or Lumo was closed at the start or end time, Lumo does it at the next tick.
+    func tick(_ now: Date = Date()) {
+        var runs = UserDefaults.standard.dictionary(forKey: "runs") as? [String: [String: Any]] ?? [:]
+        // All lights first, so that a rule for one bulb wins.
+        for r in rules.sorted(by: { $0.bulb < $1.bulb }) {
+            let w = r.window(at: now)
+            for b in bulbs where r.bulb.isEmpty || b.mac == r.bulb {
+                let k = "\(r.key)|\(b.mac)", run = runs[k]
+                let started = run?["start"] as? Date == w.start
+                if now < w.end, !started, let p = presets[r.preset] {
+                    // Save the state before the change. If it is not fresh, ask the bulb and try again at the next tick.
+                    guard let state = pilots[b.ip], pilotTimes[b.ip] ?? .distantPast > now.addingTimeInterval(-10) else {
+                        send(fd, #"{"method":"getPilot","params":{}}"#, to: b.ip)
+                        continue
+                    }
+                    // If an earlier window never ended (the Mac slept through it), keep the state from before that window.
+                    if pilot([b.ip], p) { runs[k] = ["start": w.start, "before": run?["before"] ?? presetParams(state)] }
+                } else if now >= w.end, started, let before = run?["before"] as? String, pilot([b.ip], before) {
+                    runs[k] = nil
+                }
+            }
+        }
+        UserDefaults.standard.set(runs, forKey: "runs")
+    }
+
+    // Ask the bulbs for their state each time the menu opens. The replies update the scene checkmarks.
+    func menuWillOpen(_ m: NSMenu) { for b in bulbs { send(fd, #"{"method":"getPilot","params":{}}"#, to: b.ip) } }
+
+    func refreshChecks() {
+        for (i, targets) in sceneItems {
+            i.state = targets.allSatisfy { pilots[$0]?["state"] as? Bool == true && pilots[$0]?["sceneId"] as? Int == i.tag } ? .on : .off
+        }
     }
 
     @objc func rediscover() {
@@ -197,12 +287,14 @@ class App: NSObject, NSApplicationDelegate {
         item.menu?.addItem(withTitle: "Searching…", action: nil, keyEquivalent: "")
         DispatchQueue.global().async {
             let found = discover()
-            DispatchQueue.main.async { self.bulbs = found; self.buildMenu() }
+            DispatchQueue.main.async { self.bulbs = found; self.buildMenu(); self.tick() }
         }
     }
 
     func buildMenu() {
         let m = NSMenu()
+        m.delegate = self
+        sceneItems = []
         if bulbs.isEmpty { m.addItem(withTitle: "No bulbs found", action: nil, keyEquivalent: "") }
         if bulbs.count > 1 { addControls(m, title: "All lights", targets: bulbs.map(\.ip)) }
         for b in bulbs.sorted(by: { name($0) < name($1) }) {
@@ -211,15 +303,32 @@ class App: NSObject, NSApplicationDelegate {
             let rename = sub.addItem(withTitle: "Rename…", action: #selector(rename(_:)), keyEquivalent: "")
             rename.target = self
             rename.representedObject = b.mac
+            let save = sub.addItem(withTitle: "Save as Preset…", action: #selector(savePreset(_:)), keyEquivalent: "")
+            save.target = self
+            save.representedObject = b.ip
             sub.addItem(withTitle: "\(b.ip) · \(b.mac)", action: nil, keyEquivalent: "").isEnabled = false
         }
         m.addItem(.separator())
+        let schedule = NSMenu()
+        for (n, r) in rules.enumerated() {
+            let del = NSMenu()
+            let d = del.addItem(withTitle: "Delete", action: #selector(deleteRule(_:)), keyEquivalent: "")
+            d.target = self
+            d.tag = n
+            let who = r.bulb.isEmpty ? "All lights" : aliases[r.bulb] ?? bulbs.first { $0.mac == r.bulb }?.ip ?? r.bulb
+            schedule.addItem(withTitle: "\(clock(r.minute)) – \(clock(r.stop))  \(who) · \(r.preset)", action: nil, keyEquivalent: "").submenu = del
+        }
+        if rules.isEmpty { schedule.addItem(withTitle: "No rules", action: nil, keyEquivalent: "").isEnabled = false }
+        schedule.addItem(.separator())
+        schedule.addItem(withTitle: "Add Rule…", action: #selector(addRule), keyEquivalent: "").target = self
+        m.addItem(withTitle: "Schedule", action: nil, keyEquivalent: "").submenu = schedule
         m.addItem(withTitle: "Rediscover", action: #selector(rediscover), keyEquivalent: "r").target = self
         let login = m.addItem(withTitle: "Start at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         m.addItem(withTitle: "Quit Lumo", action: #selector(NSApp.terminate), keyEquivalent: "q")
         item.menu = m
+        refreshChecks()
     }
 
     @objc func toggleLogin(_ i: NSMenuItem) {
@@ -229,22 +338,106 @@ class App: NSObject, NSApplicationDelegate {
 
     func name(_ b: Bulb) -> String { aliases[b.mac] ?? b.ip }
 
-    @objc func rename(_ i: NSMenuItem) {
-        guard let mac = i.representedObject as? String else { return }
+    // Shows an alert with `view` below the text. Returns true if the user clicked Save.
+    func ask(_ title: String, _ info: String, _ view: NSView) -> Bool {
         let alert = NSAlert()
-        alert.messageText = "Rename bulb"
-        alert.informativeText = "Leave empty to show the IP address."
+        alert.messageText = title
+        alert.informativeText = info
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        field.stringValue = aliases[mac] ?? ""
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
+        alert.accessoryView = view
+        alert.window.initialFirstResponder = view
         NSApp.activate()
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    func textField(_ value: String) -> NSTextField {
+        let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        f.stringValue = value
+        return f
+    }
+
+    @objc func rename(_ i: NSMenuItem) {
+        guard let mac = i.representedObject as? String else { return }
+        let field = textField(aliases[mac] ?? "")
+        guard ask("Rename bulb", "Leave empty to show the IP address.", field) else { return }
         let text = field.stringValue.trimmingCharacters(in: .whitespaces)
         aliases[mac] = text.isEmpty ? nil : text
         buildMenu()
+    }
+
+    @objc func savePreset(_ i: NSMenuItem) {
+        guard let ip = i.representedObject as? String else { return }
+        guard let r = pilots[ip] else {
+            let alert = NSAlert()
+            alert.messageText = "Lumo cannot read this bulb"
+            alert.informativeText = "The bulb did not send its state. Open the menu again, then try again."
+            NSApp.activate()
+            alert.runModal()
+            return
+        }
+        let field = textField("")
+        guard ask("Save as preset", "Lumo saves the current state of this bulb: on or off, brightness, and colour, white or scene.", field) else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        presets[name] = presetParams(r)
+        buildMenu()
+    }
+
+    @objc func deletePreset(_ i: NSMenuItem) {
+        guard let name = i.representedObject as? String else { return }
+        presets[name] = nil
+        rules.removeAll { $0.preset == name }
+        buildMenu()
+    }
+
+    @objc func addRule() {
+        guard !presets.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "No presets"
+            alert.informativeText = "Set a bulb as you like it, then click Save as Preset… in the menu of the bulb."
+            NSApp.activate()
+            alert.runModal()
+            return
+        }
+        let picker = { (d: Date) -> NSDatePicker in
+            let p = NSDatePicker()
+            p.datePickerStyle = .textFieldAndStepper
+            p.datePickerElements = .hourMinute
+            p.dateValue = d
+            return p
+        }
+        let from = picker(Date()), to = picker(Date().addingTimeInterval(3600))
+        let sorted = bulbs.sorted { name($0) < name($1) }
+        let lights = NSPopUpButton()
+        lights.addItems(withTitles: ["All lights"] + sorted.map(name))
+        let preset = NSPopUpButton()
+        preset.addItems(withTitles: presets.keys.sorted())
+        let grid = NSGridView(views: [
+            [NSTextField(labelWithString: "From:"), from],
+            [NSTextField(labelWithString: "To:"), to],
+            [NSTextField(labelWithString: "Lights:"), lights],
+            [NSTextField(labelWithString: "Preset:"), preset],
+        ])
+        grid.column(at: 0).xPlacement = .trailing
+        grid.rowAlignment = .firstBaseline
+        grid.frame = NSRect(origin: .zero, size: grid.fittingSize)
+        guard ask("Add rule", "Each day at the start time, Lumo applies the preset. At the end time, Lumo puts the lights back as they were. If the Mac is asleep at one of these times, Lumo does it when the Mac wakes.", grid) else { return }
+        let minute = { (p: NSDatePicker) in Calendar.current.component(.hour, from: p.dateValue) * 60 + Calendar.current.component(.minute, from: p.dateValue) }
+        let mac = lights.indexOfSelectedItem == 0 ? "" : sorted[lights.indexOfSelectedItem - 1].mac
+        rules = (rules + [Rule(minute: minute(from), bulb: mac, preset: preset.titleOfSelectedItem!, end: minute(to))]).sorted { $0.minute < $1.minute }
+        buildMenu()
+        tick()
+    }
+
+    @objc func deleteRule(_ i: NSMenuItem) {
+        rules.remove(at: i.tag)
+        buildMenu()
+    }
+
+    func clock(_ minute: Int) -> String {
+        let d = Calendar.current.date(bySettingHour: minute / 60, minute: minute % 60, second: 0, of: Date())!
+        return DateFormatter.localizedString(from: d, dateStyle: .none, timeStyle: .short)
     }
 
     @discardableResult
@@ -267,8 +460,29 @@ class App: NSObject, NSApplicationDelegate {
             let i = sceneMenu.addItem(withTitle: n, action: #selector(fire(_:)), keyEquivalent: "")
             i.target = self
             i.representedObject = (targets, #"{"sceneId":\#(id)}"#)
+            i.tag = id
+            sceneItems.append((i, targets))
         }
         sub.addItem(withTitle: "Scenes", action: nil, keyEquivalent: "").submenu = sceneMenu
+        let presetMenu = NSMenu()
+        for n in presets.keys.sorted() {
+            let i = presetMenu.addItem(withTitle: n, action: #selector(fire(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = (targets, presets[n]!)
+        }
+        if presets.isEmpty {
+            presetMenu.addItem(withTitle: "No presets", action: nil, keyEquivalent: "").isEnabled = false
+        } else {
+            let del = NSMenu()
+            for n in presets.keys.sorted() {
+                let i = del.addItem(withTitle: n, action: #selector(deletePreset(_:)), keyEquivalent: "")
+                i.target = self
+                i.representedObject = n
+            }
+            presetMenu.addItem(.separator())
+            presetMenu.addItem(withTitle: "Delete", action: nil, keyEquivalent: "").submenu = del
+        }
+        sub.addItem(withTitle: "Presets", action: nil, keyEquivalent: "").submenu = presetMenu
         m.addItem(withTitle: title, action: nil, keyEquivalent: "").submenu = sub
         return sub
     }
@@ -316,8 +530,24 @@ class App: NSObject, NSApplicationDelegate {
         pilot(targets, params)
     }
 
-    func pilot(_ targets: [String], _ params: String) {
-        for t in targets { send(fd, #"{"method":"setPilot","params":\#(params)}"#, to: t) }
+    // Returns false if a send failed.
+    @discardableResult
+    func pilot(_ targets: [String], _ params: String) -> Bool {
+        let p = (try? JSONSerialization.jsonObject(with: Data(params.utf8))) as? [String: Any] ?? [:]
+        var ok = true
+        for t in targets {
+            ok = send(fd, #"{"method":"setPilot","params":\#(params)}"#, to: t) && ok
+            // Update the known state now, so that the checkmarks are correct before the next getPilot reply.
+            var s = pilots[t] ?? [:]
+            if p["r"] != nil || p["temp"] != nil { s["sceneId"] = 0 }
+            if p["r"] != nil { s["temp"] = nil }
+            if p["temp"] != nil { for k in ["r", "g", "b"] { s[k] = nil } }
+            s["state"] = true
+            s.merge(p) { $1 }
+            pilots[t] = s
+        }
+        refreshChecks()
+        return ok
     }
 }
 
