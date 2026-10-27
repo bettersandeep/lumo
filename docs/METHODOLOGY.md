@@ -133,6 +133,8 @@ It does not use other libraries.
 
 - Discovery: Lumo sends `getPilot` to the broadcast address and to all addresses in the /24 network, 3 times.
   It keeps each IP address that sends a reply, with the MAC address from the reply.
+  Lumo searches when it starts and when the Mac wakes.
+  If it finds no bulbs, it searches again every 30 seconds, because the network is often not ready at login.
 - Control: each menu item sends one `setPilot` command.
   - On and off: `{"state":true}` or `{"state":false}`.
   - Brightness: `{"dimming":10}` to `{"dimming":100}`.
@@ -144,6 +146,14 @@ It does not use other libraries.
 - Aliases: Lumo keeps each name with the MAC address of the bulb.
   Thus, the name stays correct when the IP address changes.
 - Start at login: Lumo uses `SMAppService.mainApp.register()`.
+- Scene checkmark: when the menu opens, Lumo sends `getPilot` to each bulb.
+  The `sceneId` in the reply shows the scene that is on.
+- Presets: Lumo changes a `getPilot` reply into `setPilot` params.
+  It keeps `sceneId` and `speed` for a scene, `temp` for white, or `r`, `g`, `b`, `c` and `w` for a colour, with `dimming`.
+- Schedule: each rule has a start time and an end time.
+  At the start time, Lumo saves the state of each bulb as a preset and applies the preset of the rule.
+  At the end time, Lumo applies the saved state.
+  A timer checks the rules every 5 seconds, so a rule that was due while the Mac slept runs when the Mac wakes.
 
 ## Summary of evidence
 
