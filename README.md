@@ -43,6 +43,10 @@ Each bulb has its own submenu.
 If there is more than one bulb, the **All lights** submenu controls all of them.
 To give a bulb a name, open its submenu and click **Rename…**.
 
+Lumo searches for bulbs when it starts and each time the Mac wakes.
+If it finds no bulbs, for example because the network is not ready after login, it searches again every 30 seconds.
+To search now, click **Rediscover**.
+
 ### Presets
 
 1. Set a bulb as you like it, with the menu or with the WiZ app.
@@ -74,7 +78,9 @@ A rule for one bulb is stronger than a rule for **All lights**.
 
 To delete a rule, open the rule and click **Delete**.
 
-To list the bulbs from the terminal:
+### Terminal
+
+To list the bulbs:
 
 ```sh
 /Applications/Lumo.app/Contents/MacOS/Lumo --discover
