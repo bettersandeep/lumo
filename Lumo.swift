@@ -224,6 +224,8 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Last known getPilot result of each bulb, by IP.
     var pilots: [String: [String: Any]] = [:]
     var pilotTimes: [String: Date] = [:]
+    var searching = false
+    var lastSearch = Date.distantPast
     var sceneItems: [(item: NSMenuItem, targets: [String])] = []
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -243,6 +245,8 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }.start()
         // Common mode, so that the schedule also runs while a menu is open.
         RunLoop.main.add(Timer(timeInterval: 5, repeats: true) { _ in self.tick() }, forMode: .common)
+        // After sleep, the network can change and a bulb can get a new IP address.
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(rediscover), name: NSWorkspace.didWakeNotification, object: nil)
         rediscover()
     }
 
@@ -250,7 +254,10 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // the preset, one time. Changes you make by hand stay. When the window ends, Lumo puts back the saved state.
     // If the Mac was asleep or Lumo was closed at the start or end time, Lumo does it at the next tick.
     func tick(_ now: Date = Date()) {
+        // At login the network is often not up yet, so the first search finds nothing. Search again.
+        if bulbs.isEmpty, !searching, now.timeIntervalSince(lastSearch) > 30 { rediscover() }
         var runs = UserDefaults.standard.dictionary(forKey: "runs") as? [String: [String: Any]] ?? [:]
+        runs = runs.filter { k, _ in rules.contains { k.hasPrefix($0.key + "|") } } // forget deleted rules
         // All lights first, so that a rule for one bulb wins.
         for r in rules.sorted(by: { $0.bulb < $1.bulb }) {
             let w = r.window(at: now)
@@ -283,11 +290,13 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func rediscover() {
+        searching = true
+        lastSearch = Date()
         item.menu = NSMenu()
         item.menu?.addItem(withTitle: "Searching…", action: nil, keyEquivalent: "")
         DispatchQueue.global().async {
             let found = discover()
-            DispatchQueue.main.async { self.bulbs = found; self.buildMenu(); self.tick() }
+            DispatchQueue.main.async { self.bulbs = found; self.searching = false; self.buildMenu(); self.tick() }
         }
     }
 
